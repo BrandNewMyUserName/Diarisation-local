@@ -1,0 +1,15 @@
+# WhisperX diarisation pipeline
+# Install: pip install -r requirements.txt
+
+# Core
+whisperx
+torch
+torchaudio
+
+# Environment variables
+python-dotenv
+
+# Memory monitoring (optional but recommended)
+psutil
+
+huggingface_hub[hf_xet]
