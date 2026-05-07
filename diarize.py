@@ -58,7 +58,7 @@ DEFAULT_CONFIG: dict = {
     "device": "cuda",
 
     # Тип обчислень: "float16" (GPU), "int8" (CPU), "float32" (точніше)
-    "compute_type": "int8",
+    "compute_type": "float16",
 
     # Більший batch_size = швидше, але більше VRAM. При помилці — зменшити
     "batch_size": 8,
