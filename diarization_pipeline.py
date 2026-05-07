@@ -910,6 +910,7 @@ def transcribe_file(
 
         t0 = time.perf_counter()
         diarize_segments = None
+        speaker_embeddings = None
         if not config.get("effective_diarization_model"):
             logger.warning("   ⚠ Модель діаризації не налаштована — діаризацію пропущено")
             result.setdefault("pipeline_warnings", []).append("diarization_skipped_no_model")
@@ -923,7 +924,17 @@ def transcribe_file(
             else:
                 diarize_kwargs["min_speakers"] = config["min_speakers"]
                 diarize_kwargs["max_speakers"] = config["max_speakers"]
+            # Enable speaker embedding extraction for speaker tracking
+            diarize_kwargs["return_embeddings"] = True
             diarize_segments = diarize_model(audio, **diarize_kwargs)
+            
+            # Extract speaker embeddings if available
+            speaker_embeddings = None
+            if isinstance(diarize_segments, tuple) and len(diarize_segments) >= 2:
+                diarize_segments, speaker_embeddings = diarize_segments[0], diarize_segments[1]
+                if speaker_embeddings:
+                    logger.info(f"   ✓ Отримано speaker embeddings для {len(speaker_embeddings)} speaker(s)")
+            
             result = whisperx.assign_word_speakers(diarize_segments, result)
             speakers = sorted({seg.get("speaker", "") for seg in result.get("segments", []) if seg.get("speaker")})
             logger.info(f"   Знайдено спікерів: {len(speakers)} → {speakers}")
@@ -937,6 +948,14 @@ def transcribe_file(
         logger.info("▶ Крок 5/5: QA-оцінка та збереження")
         quality = calculate_quality(result, diarize_segments, duration_sec)
         result["quality"] = quality
+        
+        # Store speaker embeddings if extracted
+        if speaker_embeddings:
+            result["speaker_embeddings"] = {
+                speaker_id: emb.tolist() if hasattr(emb, 'tolist') else emb
+                for speaker_id, emb in speaker_embeddings.items()
+            }
+        
         result["source"] = {
             "path": str(audio_path),
             "relative_key": _file_key(audio_path, input_root),
