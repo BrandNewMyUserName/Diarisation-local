@@ -71,6 +71,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "diarization_model": "pyannote/speaker-diarization-community-1",
     "offline_diarization_model": "pyannote/speaker-diarization-3.1",
     "offline_diarization_fallback": True,
+    "extract_speaker_embeddings": True,
     "align_words": True,
     "output_format": "all",
     "min_confidence": 0.0,
@@ -174,6 +175,7 @@ def _config_hash(config: dict[str, Any]) -> str:
         "max_speakers": config["max_speakers"],
         "num_speakers": config.get("num_speakers"),
         "effective_diarization_model": config.get("effective_diarization_model") or _effective_diarization_model(config),
+        "extract_speaker_embeddings": config.get("extract_speaker_embeddings", True),
         "align_words": config["align_words"],
         "output_format": _normalize_formats(config["output_format"]),
         "extensions": sorted(config["extensions"]),
@@ -234,6 +236,21 @@ def _atomic_write_json(path: Path, payload: Any) -> None:
             tmp_path.unlink(missing_ok=True)
         finally:
             raise last_error or PermissionError(f"Cannot replace {path}")
+
+
+def _json_output_has_speaker_embeddings(output_paths: list[str]) -> bool:
+    for output_path in output_paths:
+        path = Path(output_path)
+        if path.suffix.lower() != ".json" or not path.exists():
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as fp:
+                data = json.load(fp)
+            embeddings = data.get("speaker_embeddings")
+            return isinstance(embeddings, dict) and bool(embeddings)
+        except Exception:
+            return False
+    return False
 
 
 def _looks_like_oom(exc: BaseException) -> bool:
@@ -393,7 +410,13 @@ class ProgressTracker:
         self.write_quality_csv()
         return record
 
-    def is_completed(self, path: Path, fingerprint: dict[str, Any], config_hash_value: str) -> bool:
+    def is_completed(
+        self,
+        path: Path,
+        fingerprint: dict[str, Any],
+        config_hash_value: str,
+        require_speaker_embeddings: bool = False,
+    ) -> bool:
         record = self.record_for(path)
         if record.get("status") != "done":
             return False
@@ -402,7 +425,11 @@ class ProgressTracker:
         if record.get("config_hash") != config_hash_value:
             return False
         output_paths = record.get("output_paths") or []
-        return bool(output_paths) and all(Path(p).exists() for p in output_paths)
+        if not output_paths or not all(Path(p).exists() for p in output_paths):
+            return False
+        if require_speaker_embeddings and not _json_output_has_speaker_embeddings(output_paths):
+            return False
+        return True
 
     def write_quality_csv(self) -> None:
         rows: list[dict[str, Any]] = []
@@ -924,16 +951,19 @@ def transcribe_file(
             else:
                 diarize_kwargs["min_speakers"] = config["min_speakers"]
                 diarize_kwargs["max_speakers"] = config["max_speakers"]
-            # Enable speaker embedding extraction for speaker tracking
-            diarize_kwargs["return_embeddings"] = True
+            # Enable speaker embedding extraction for cross-file speaker tracking.
+            if config.get("extract_speaker_embeddings", True):
+                diarize_kwargs["return_embeddings"] = True
             diarize_segments = diarize_model(audio, **diarize_kwargs)
-            
+
             # Extract speaker embeddings if available
             speaker_embeddings = None
             if isinstance(diarize_segments, tuple) and len(diarize_segments) >= 2:
                 diarize_segments, speaker_embeddings = diarize_segments[0], diarize_segments[1]
                 if speaker_embeddings:
                     logger.info(f"   ✓ Отримано speaker embeddings для {len(speaker_embeddings)} speaker(s)")
+            if config.get("extract_speaker_embeddings", True) and not speaker_embeddings:
+                logger.warning("   ⚠ Speaker embeddings requested but not returned by diarization model")
             
             result = whisperx.assign_word_speakers(diarize_segments, result)
             speakers = sorted({seg.get("speaker", "") for seg in result.get("segments", []) if seg.get("speaker")})
@@ -970,6 +1000,8 @@ def transcribe_file(
             "preferred_languages": config.get("preferred_languages"),
             "fallback_language": config.get("fallback_language"),
             "diarization_model": runtime.diarization_model_name or config.get("effective_diarization_model"),
+            "speaker_embeddings_requested": bool(config.get("extract_speaker_embeddings", True)),
+            "speaker_embeddings_count": len(speaker_embeddings) if speaker_embeddings else 0,
             "device": config["device"],
             "compute_type": config["compute_type"],
             "batch_size": config["batch_size"],
@@ -1129,17 +1161,18 @@ def process_directory(config: dict[str, Any]) -> int:
             fingerprint = _file_fingerprint(audio_path)
             if record.get("fingerprint") != fingerprint or not isinstance(duration, (int, float)):
                 duration = probe_audio_duration(audio_path)
-            tracker.update_file(
-                audio_path,
-                status=record.get("status", "pending"),
-                stage=record.get("stage", "queued"),
-                index=idx,
-                total_files=len(audio_files),
-                source_path=str(audio_path),
-                fingerprint=fingerprint,
-                duration_sec=duration,
-                config_hash=cfg_hash,
-            )
+            probe_updates = {
+                "status": record.get("status", "pending"),
+                "stage": record.get("stage", "queued"),
+                "index": idx,
+                "total_files": len(audio_files),
+                "source_path": str(audio_path),
+                "fingerprint": fingerprint,
+                "duration_sec": duration,
+            }
+            if record.get("status") != "done" or record.get("config_hash") == cfg_hash:
+                probe_updates["config_hash"] = cfg_hash
+            tracker.update_file(audio_path, **probe_updates)
             if idx % 100 == 0 or idx == len(audio_files):
                 logger.info(f"  ffprobe: {idx}/{len(audio_files)}")
 
@@ -1165,7 +1198,16 @@ def process_directory(config: dict[str, Any]) -> int:
                 logger.warning("Зупинку запрошено користувачем. Manifest вже збережено — можна продовжити запуском тієї ж команди.")
                 break
 
-            if config.get("resume", True) and not config.get("force") and tracker.is_completed(audio_path, fingerprint, cfg_hash):
+            if (
+                config.get("resume", True)
+                and not config.get("force")
+                and tracker.is_completed(
+                    audio_path,
+                    fingerprint,
+                    cfg_hash,
+                    require_speaker_embeddings=config.get("extract_speaker_embeddings", False),
+                )
+            ):
                 skipped_count += 1
                 tracker.update_file(
                     audio_path,
@@ -1274,6 +1316,7 @@ def build_config_from_args(argv: Optional[list[str]] = None) -> dict[str, Any]:
     parser.add_argument("--diarization-model", default=DEFAULT_CONFIG["diarization_model"], help="Основна pyannote модель діаризації")
     parser.add_argument("--offline-diarization-model", default=DEFAULT_CONFIG["offline_diarization_model"], help="Cached fallback модель без HF_TOKEN")
     parser.add_argument("--no-offline-diarization-fallback", action="store_true", help="Не використовувати cached fallback без HF_TOKEN")
+    parser.add_argument("--no-speaker-embeddings", action="store_true", help="Не зберігати speaker embeddings у JSON")
     parser.add_argument("--formats", nargs="+", default=DEFAULT_CONFIG["output_format"], choices=["txt", "srt", "vtt", "json", "tsv", "all"], dest="output_format")
     parser.add_argument("--extensions", nargs="+", default=DEFAULT_CONFIG["extensions"], help="Розширення аудіофайлів")
     parser.add_argument("--no-align", action="store_true", help="Пропустити word alignment")
@@ -1314,6 +1357,7 @@ def build_config_from_args(argv: Optional[list[str]] = None) -> dict[str, Any]:
     cfg["diarization_model"] = args.diarization_model
     cfg["offline_diarization_model"] = args.offline_diarization_model
     cfg["offline_diarization_fallback"] = not args.no_offline_diarization_fallback
+    cfg["extract_speaker_embeddings"] = not args.no_speaker_embeddings
     cfg["output_format"] = args.output_format
     cfg["extensions"] = [ext if ext.startswith(".") else f".{ext}" for ext in args.extensions]
     cfg["align_words"] = not args.no_align

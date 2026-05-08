@@ -10,10 +10,12 @@ __pycache__/
 output/
 output-test/
 output-community-test/
+output-embedding-smoke/
 exports/
 logs/
 logs-test/
 logs-community-test/
+logs-embedding-smoke/
 *.log
 
 # Local editor/runtime

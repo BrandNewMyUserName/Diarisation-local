@@ -15,6 +15,14 @@ class PipelineTests(unittest.TestCase):
 
         self.assertEqual(pipeline._config_hash(cfg_a), pipeline._config_hash(cfg_b))
 
+    def test_config_hash_includes_speaker_embedding_mode(self):
+        cfg_a = pipeline.DEFAULT_CONFIG.copy()
+        cfg_b = pipeline.DEFAULT_CONFIG.copy()
+        cfg_a["extract_speaker_embeddings"] = True
+        cfg_b["extract_speaker_embeddings"] = False
+
+        self.assertNotEqual(pipeline._config_hash(cfg_a), pipeline._config_hash(cfg_b))
+
     def test_completed_record_remains_resumable_after_skip_metadata(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "audio"
@@ -40,6 +48,51 @@ class PipelineTests(unittest.TestCase):
 
             tracker.update_file(audio, status="done", stage="done", last_resume_skip_at="now")
             self.assertTrue(tracker.is_completed(audio, fingerprint, "cfg"))
+
+    def test_completed_record_can_require_speaker_embeddings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "audio"
+            state = Path(tmp) / "state"
+            output = Path(tmp) / "out.json"
+            root.mkdir()
+            audio = root / "sample.wav"
+            audio.write_bytes(b"fake")
+            output.write_text('{"segments": []}', encoding="utf-8")
+
+            logger = logging.getLogger("test-progress")
+            tracker = pipeline.ProgressTracker(state, root, "cfg", logger)
+            fingerprint = pipeline._file_fingerprint(audio)
+            tracker.update_file(
+                audio,
+                status="done",
+                stage="done",
+                fingerprint=fingerprint,
+                config_hash="cfg",
+                output_paths=[str(output)],
+            )
+
+            self.assertTrue(tracker.is_completed(audio, fingerprint, "cfg"))
+            self.assertFalse(
+                tracker.is_completed(
+                    audio,
+                    fingerprint,
+                    "cfg",
+                    require_speaker_embeddings=True,
+                )
+            )
+
+            output.write_text(
+                '{"segments": [], "speaker_embeddings": {"SPEAKER_00": [0.1, 0.2]}}',
+                encoding="utf-8",
+            )
+            self.assertTrue(
+                tracker.is_completed(
+                    audio,
+                    fingerprint,
+                    "cfg",
+                    require_speaker_embeddings=True,
+                )
+            )
 
     def test_quality_scores_good_speaker_assignment_high(self):
         result = {

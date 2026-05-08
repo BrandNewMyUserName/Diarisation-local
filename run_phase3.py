@@ -3,9 +3,10 @@
 
 import json
 import logging
+import argparse
 from pathlib import Path
 
-from speaker_clustering import run_phase3
+from speaker_clustering import SpeakerClusterer, run_phase3
 
 # Setup logging
 logging.basicConfig(
@@ -16,6 +17,15 @@ logger = logging.getLogger(__name__)
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Cluster speakers using Phase 2 embeddings.")
+    parser.add_argument(
+        "--similarity-threshold",
+        type=float,
+        default=SpeakerClusterer.DEFAULT_SIMILARITY_THRESHOLD,
+        help="Cosine similarity threshold for joining speaker embeddings.",
+    )
+    args = parser.parse_args()
+
     output_dir = Path("output/_progress")
     embeddings_path = output_dir / "phase2_embeddings.json"
 
@@ -29,7 +39,12 @@ def main():
         return 1
 
     # Run Phase 3
-    result = run_phase3(embeddings_path, output_dir, logger)
+    result = run_phase3(
+        embeddings_path,
+        output_dir,
+        logger,
+        similarity_threshold=args.similarity_threshold,
+    )
 
     logger.info(f"\nPhase 3 result:")
     logger.info(json.dumps(result, indent=2))
@@ -41,6 +56,7 @@ def main():
         logger.info(f"  • Speaker instances clustered: {result['total_speaker_instances']}")
         logger.info(f"  • Unique cluster groups: {result['unique_clusters']}")
         logger.info(f"  • Unique persons identified: {result['unique_persons']}")
+        logger.info(f"  • Similarity threshold: {result['similarity_threshold']}")
         logger.info(f"  • Export: {result['export_path']}")
         logger.info("\nPhase 3 COMPLETE - Ready for Phase 4 (person linking)")
         return 0

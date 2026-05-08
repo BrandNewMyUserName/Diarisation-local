@@ -5,16 +5,19 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
 import numpy as np
-from scipy.cluster.hierarchy import dendrogram, linkage, fcluster
-from scipy.spatial.distance import pdist, squareform
+from scipy.cluster.hierarchy import fcluster, linkage
+from scipy.spatial.distance import pdist
 
 
 class SpeakerClusterer:
     """Cluster speakers using embedding similarity to identify unique persons."""
+
+    DEFAULT_SIMILARITY_THRESHOLD = 0.67
 
     def __init__(
         self,
@@ -27,6 +30,8 @@ class SpeakerClusterer:
         self.speaker_to_file: dict[str, tuple[str, str]] = {}  # global_id -> (file_key, speaker_label)
         self.clusters: dict[int, list[str]] = {}  # cluster_id -> [speaker_ids]
         self.person_assignments: dict[str, int] = {}  # (file, speaker) -> person_id
+        self.similarity_threshold = self.DEFAULT_SIMILARITY_THRESHOLD
+        self.skipped_embeddings: list[dict[str, Any]] = []
 
     def load_embeddings(self) -> bool:
         """Load speaker embeddings from Phase 2 output."""
@@ -52,11 +57,33 @@ class SpeakerClusterer:
 
         for file_key, speakers in self.embeddings.items():
             for speaker_label, embedding in speakers.items():
-                if embedding:  # Skip empty embeddings
-                    embeddings_list.append(embedding)
-                    global_id = f"{file_key}:::{speaker_label}"
-                    speaker_ids.append(global_id)
-                    self.speaker_to_file[global_id] = (file_key, speaker_label)
+                if not embedding:
+                    self.skipped_embeddings.append(
+                        {"file_key": file_key, "speaker_label": speaker_label, "reason": "empty_embedding"}
+                    )
+                    continue
+
+                vector = np.asarray(embedding, dtype=np.float32)
+                if vector.ndim != 1:
+                    self.skipped_embeddings.append(
+                        {"file_key": file_key, "speaker_label": speaker_label, "reason": "non_vector_embedding"}
+                    )
+                    continue
+                if not np.isfinite(vector).all():
+                    self.skipped_embeddings.append(
+                        {"file_key": file_key, "speaker_label": speaker_label, "reason": "non_finite_embedding"}
+                    )
+                    continue
+                if float(np.linalg.norm(vector)) == 0.0:
+                    self.skipped_embeddings.append(
+                        {"file_key": file_key, "speaker_label": speaker_label, "reason": "zero_norm_embedding"}
+                    )
+                    continue
+
+                embeddings_list.append(vector)
+                global_id = f"{file_key}:::{speaker_label}"
+                speaker_ids.append(global_id)
+                self.speaker_to_file[global_id] = (file_key, speaker_label)
 
         if not embeddings_list:
             self.logger.error("No embeddings found to cluster!")
@@ -64,6 +91,11 @@ class SpeakerClusterer:
 
         matrix = np.array(embeddings_list, dtype=np.float32)
         self.logger.info(f"Built embedding matrix: {matrix.shape}")
+        if self.skipped_embeddings:
+            self.logger.warning(
+                "Skipped %d invalid embedding(s) before clustering",
+                len(self.skipped_embeddings),
+            )
         return matrix, speaker_ids
 
     def compute_linkage(self, embedding_matrix: np.ndarray) -> np.ndarray:
@@ -76,20 +108,27 @@ class SpeakerClusterer:
         distances = pdist(embedding_matrix, metric="cosine")
 
         self.logger.info("Computing hierarchical clustering linkage...")
-        linkage_matrix = linkage(distances, method="ward")
+        linkage_matrix = linkage(distances, method="average")
         return linkage_matrix
 
-    def cluster_speakers(self, linkage_matrix: np.ndarray, threshold: float = 0.5) -> dict[int, list[str]]:
+    def cluster_speakers(
+        self,
+        linkage_matrix: np.ndarray,
+        speaker_ids: list[str],
+        similarity_threshold: float = 0.5,
+    ) -> dict[int, list[str]]:
         """Cluster speakers using agglomerative clustering."""
-        if linkage_matrix.size == 0:
+        if not speaker_ids:
             return {}
+        if len(speaker_ids) == 1 or linkage_matrix.size == 0:
+            return {1: [speaker_ids[0]]}
 
-        # Convert cosine distance threshold to dendrogram distance cutoff
-        # threshold=0.5 cosine similarity = 0.5 distance
-        clusters_array = fcluster(linkage_matrix, threshold, criterion="distance")
+        # Cosine distance is 1 - cosine similarity.
+        distance_cutoff = 1.0 - similarity_threshold
+        clusters_array = fcluster(linkage_matrix, distance_cutoff, criterion="distance")
 
         clusters = {}
-        for speaker_id, cluster_id in zip(self.speaker_to_file.keys(), clusters_array):
+        for speaker_id, cluster_id in zip(speaker_ids, clusters_array):
             if cluster_id not in clusters:
                 clusters[cluster_id] = []
             clusters[cluster_id].append(speaker_id)
@@ -115,14 +154,16 @@ class SpeakerClusterer:
         """Export clustering results to JSON."""
         export = {
             "metadata": {
-                "export_date": None,  # To be filled by caller
+                "export_date": datetime.now().astimezone().isoformat(timespec="seconds"),
                 "total_cluster_groups": len(self.clusters),
                 "total_speaker_instances": sum(len(s) for s in self.clusters.values()),
                 "clustering_method": "agglomerative_hierarchical",
                 "distance_metric": "cosine",
-                "linkage_method": "ward",
-                "similarity_threshold": 0.5,
+                "linkage_method": "average",
+                "similarity_threshold": self.similarity_threshold,
+                "skipped_embeddings": len(self.skipped_embeddings),
             },
+            "skipped_embeddings": self.skipped_embeddings,
             "clusters": {},
         }
 
@@ -150,6 +191,7 @@ def run_phase3(
     embeddings_path: Optional[Path] = None,
     output_dir: Optional[Path] = None,
     logger: Optional[logging.Logger] = None,
+    similarity_threshold: float = SpeakerClusterer.DEFAULT_SIMILARITY_THRESHOLD,
 ) -> dict[str, Any]:
     """Execute Phase 3: Speaker clustering using embeddings."""
 
@@ -186,14 +228,19 @@ def run_phase3(
 
     # Compute linkage and cluster
     linkage_matrix = clusterer.compute_linkage(embedding_matrix)
-    if linkage_matrix.size == 0:
+    if embedding_matrix.shape[0] > 1 and linkage_matrix.size == 0:
         return {
             "status": "error",
             "message": "Clustering failed",
         }
 
     # Perform clustering
-    clusters = clusterer.cluster_speakers(linkage_matrix, threshold=0.5)
+    clusterer.similarity_threshold = similarity_threshold
+    clusters = clusterer.cluster_speakers(
+        linkage_matrix,
+        speaker_ids,
+        similarity_threshold=clusterer.similarity_threshold,
+    )
     clusterer.clusters = clusters
 
     # Assign person IDs
@@ -208,7 +255,9 @@ def run_phase3(
     return {
         "status": "success",
         "total_speaker_instances": len(speaker_ids),
+        "skipped_embeddings": len(clusterer.skipped_embeddings),
         "unique_clusters": len(clusters),
         "unique_persons": len(set(person_assignments.values())),
+        "similarity_threshold": clusterer.similarity_threshold,
         "export_path": str(export_path),
     }

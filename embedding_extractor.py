@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
@@ -44,20 +45,75 @@ class EmbeddingExtractor:
     def scan_output_directory(self) -> dict[str, Path]:
         """Scan for all WhisperX JSON output files."""
         json_files = {}
+        manifest_outputs = self._manifest_json_outputs()
+
         for json_path in self.output_dir.glob("**/*.json"):
             # Skip manifest and other non-transcript files
-            if json_path.name in ["manifest.json", "phase1_call_records.json", "phase2_embeddings.json"]:
+            if json_path.name in [
+                "manifest.json",
+                "phase1_call_records.json",
+                "phase2_embeddings.json",
+                "phase3_speaker_clusters.json",
+                "persons.json",
+            ]:
                 continue
-            # Extract file key from path
-            try:
-                relative = json_path.relative_to(self.output_dir)
-                # Construct key similar to manifest
-                key = relative.parent.name + "/" + json_path.stem.split("___")[0] + ".mp3"
+
+            key = manifest_outputs.get(_path_lookup_key(json_path))
+            if key is None:
+                key = manifest_outputs.get(_path_lookup_key(json_path.resolve()))
+            if key is None:
+                key = self._file_key_from_json(json_path)
+
+            if key:
                 json_files[key] = json_path
-            except Exception:
-                pass
 
         return json_files
+
+    def _manifest_json_outputs(self) -> dict[str, str]:
+        """Map transcript JSON paths to manifest file keys."""
+        manifest_path = self.output_dir / "_progress" / "manifest.json"
+        if not manifest_path.exists():
+            return {}
+
+        try:
+            with open(manifest_path, "r", encoding="utf-8") as f:
+                manifest = json.load(f)
+        except Exception as exc:
+            self.logger.debug(f"Failed to load manifest for output mapping: {exc}")
+            return {}
+
+        path_to_key: dict[str, str] = {}
+        for file_key, file_info in manifest.get("files", {}).items():
+            for output_path in file_info.get("output_paths") or []:
+                path = Path(output_path)
+                if path.suffix.lower() != ".json":
+                    continue
+                path_to_key[_path_lookup_key(path)] = file_key
+                try:
+                    path_to_key[_path_lookup_key(path.resolve())] = file_key
+                except Exception:
+                    pass
+
+        return path_to_key
+
+    def _file_key_from_json(self, json_path: Path) -> str | None:
+        """Best-effort fallback for transcript JSONs not present in manifest."""
+        try:
+            with open(json_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            relative_key = data.get("source", {}).get("relative_key")
+            if relative_key:
+                return relative_key
+        except Exception:
+            pass
+
+        try:
+            relative = json_path.relative_to(self.output_dir)
+        except ValueError:
+            return None
+
+        original_stem = json_path.stem.rsplit("__", 1)[0]
+        return f"{relative.parent.as_posix()}/{original_stem}.mp3"
 
     def extract_all_embeddings(self, file_map: dict[str, Path]) -> tuple[int, int]:
         """Extract embeddings from all JSON files."""
@@ -112,7 +168,7 @@ class EmbeddingExtractor:
         """Export embeddings to JSON file for Phase 3 clustering."""
         export = {
             "metadata": {
-                "export_date": None,  # Will be filled by caller
+                "export_date": datetime.now().astimezone().isoformat(timespec="seconds"),
                 "total_files": len(self.embedding_vectors),
                 "total_speaker_embeddings": sum(len(e) for e in self.embedding_vectors.values()),
                 "embedding_stats": self.compute_embedding_statistics(),
@@ -193,3 +249,7 @@ def run_phase2(
         "export_path": str(export_path),
         "statistics": stats,
     }
+
+
+def _path_lookup_key(path: Path) -> str:
+    return str(path).replace("\\", "/").lower()
