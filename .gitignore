@@ -1,0 +1,22 @@
+# Secrets
+.env
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+
+# Generated private outputs
+output/
+output-test/
+output-community-test/
+output-embedding-smoke/
+exports/
+logs/
+logs-test/
+logs-community-test/
+logs-embedding-smoke/
+*.log
+
+# Local editor/runtime
+.vscode/*.log

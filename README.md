@@ -1,10 +1,18 @@
 # Windows 11 Quick Start
 
-Коротко про логування: для кожного запуску створюється детальний запис у `logs/diarize_YYYYMMDD_HHMMSS.log` (етап обробки, час етапу, загальний час, пам'ять Python RSS і GPU).
+Цей проєкт запускає WhisperX для пакетної транскрибації та діаризації Telegram-аудіо з resumable progress tracking, ETA і QA-оцінкою по кожному файлу.
 
-## 1) Python
+Коротко про артефакти запуску:
+
+- детальний лог: `logs/diarize_YYYYMMDD_HHMMSS.log`;
+- resumable manifest: `output/_progress/manifest.json`;
+- події прогресу: `output/_progress/events.jsonl`;
+- проблемні файли: `output/_progress/errors.jsonl`;
+- QA-таблиця: `output/_progress/quality_report.csv`.
+
+## 1) Python 3.12
 ```powershell
-python -m venv .venv
+py -3.12 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
 pip install -r requirements.txt
@@ -33,25 +41,50 @@ ffprobe -version
 ```
 
 ## 4) HF token
+
+Скопіюйте `.env.example` у `.env` і заповніть токен локально. Не комітьте `.env`.
+
 ```env
-HF_TOKEN=hf_xxxxxxxxxxxxxxxxxxxxxxxxx
+HF_TOKEN=<your-hugging-face-token>
+# Optional default input folder if you do not pass an input path on CLI:
+DIARIZATION_INPUT_DIR=<path-to-audio-folder>
 ```
 
-## 5) Шлях до аудіо через код (`dir_path`)
-У `diarize.py` на строчці 36 вкажіть:
+Також потрібно прийняти умови моделей pyannote у Hugging Face, інакше діаризація не запуститься.
 
-```python
-dir_path = 
-
-DEFAULT_CONFIG: dict = {
-    "input_dir": dir_path,
-    # ...
-}
-```
-
-Після цього запуск:
+## 5) Dry run / інвентаризація
 
 ```powershell
-python .\diarize.py
+python .\diarize.py <path-to-audio-folder> --dry-run
 ```
+
+## 6) Тестовий прогін
+
+```powershell
+python .\diarize.py <path-to-audio-folder> --limit 5 --output-dir .\output-test --state-dir .\output-test\_progress --log-dir .\logs-test
+```
+
+Перевірити якість:
+
+```powershell
+Import-Csv .\output-test\_progress\quality_report.csv | Sort-Object overall_score | Select-Object -First 10
+```
+
+## 7) Повний max-quality запуск
+
+```powershell
+python .\diarize.py <path-to-audio-folder>
+```
+
+За замовчуванням використовується:
+
+- вхідна папка: CLI аргумент `<path-to-audio-folder>` або `DIARIZATION_INPUT_DIR` у `.env`;
+- модель: `large-v3`;
+- мова: auto-detect для змішаних українських/російських записів;
+- language guard: якщо короткий запис помилково визначено не як `uk`/`ru`, ASR повторюється з fallback `uk`;
+- GPU: CUDA `float16`, початковий `batch_size=16`;
+- diarization speakers: `min=1`, `max=4`;
+- output formats: `txt`, `srt`, `vtt`, `json`, `tsv`.
+
+Якщо процес зупинився, повторіть ту саму команду. Завершені файли будуть пропущені за manifest/config hash/output checks.
 
